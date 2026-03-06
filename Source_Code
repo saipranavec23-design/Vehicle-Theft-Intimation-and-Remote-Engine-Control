@@ -1,0 +1,199 @@
+// ESP32 + NEO-6M GPS + SIM800L + Relay
+// Sends Google Maps link via SMS every 60s
+// SMS "stop" turns relay OFF permanently
+
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+HardwareSerial gpsSerial(1);   // UART1: GPS
+HardwareSerial gsmSerial(2);   // UART2: SIM800L
+
+TinyGPSPlus gps;
+
+const char PHONE_NUMBER[] = "+91 put yo no here";  
+const unsigned long GPS_TIMEOUT = 10000;      
+const unsigned long AT_TIMEOUT  = 8000;       
+
+const int relayPin = 5;   // Relay IN pin
+bool motorStopped = false;  // NEW FLAG
+
+unsigned long lastLocationSend = 0;
+const unsigned long LOCATION_INTERVAL = 60000; // 60 seconds
+
+// -----------------------------------------------------
+
+bool waitForOK(HardwareSerial &serial, unsigned long timeout = AT_TIMEOUT) {
+  unsigned long start = millis();
+  String resp = "";
+
+  while (millis() - start < timeout) {
+    while (serial.available()) {
+      char c = serial.read();
+      Serial.print(c);
+      resp += c;
+
+      if (resp.indexOf("OK") != -1 || resp.indexOf(">") != -1) return true;
+      if (resp.indexOf("ERROR") != -1) return false;
+    }
+    delay(5);
+  }
+  return false;
+}
+
+// -----------------------------------------------------
+
+bool getGPSLocation(double &lat, double &lon) {
+  unsigned long start = millis();
+
+  while (millis() - start < GPS_TIMEOUT) {
+    while (gpsSerial.available() > 0) {
+      if (gps.encode(gpsSerial.read())) {
+
+        if (gps.location.isValid()) {
+          lat = gps.location.lat();
+          lon = gps.location.lng();
+          Serial.printf("GPS Fix: %.6f, %.6f\n", lat, lon);
+          return true;
+        }
+      }
+    }
+    delay(10);
+  }
+
+  Serial.println("No GPS fix");
+  return false;
+}
+
+// -----------------------------------------------------
+
+void sendSMS(const char* message) {
+  gsmSerial.println("AT");
+  waitForOK(gsmSerial);
+
+  gsmSerial.println("AT+CMGF=1");
+  waitForOK(gsmSerial);
+
+  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print(PHONE_NUMBER);
+  gsmSerial.println("\"");
+  waitForOK(gsmSerial, 10000);
+
+  gsmSerial.println(message);
+  delay(200);
+
+  gsmSerial.write(26); // CTRL+Z
+  delay(3000);
+}
+
+// -----------------------------------------------------
+
+void sendLocationSMS() {
+  double lat, lon;
+
+  if (!getGPSLocation(lat, lon)) {
+    Serial.println("Skipping SMS: No GPS fix");
+    return;
+  }
+
+  char message[200];
+  char timeStr[20] = "NoTime";
+  char dateStr[20] = "NoDate";
+
+  if (gps.time.isValid()) {
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+  }
+
+  if (gps.date.isValid()) {
+    snprintf(dateStr, sizeof(dateStr), "%04d/%02d/%02d",
+             gps.date.year(), gps.date.month(), gps.date.day());
+  }
+
+  snprintf(message, sizeof(message),
+           "Location: https://maps.google.com/?q=%.6f,%.6f\nTime: %s  Date: %s",
+           lat, lon, timeStr, dateStr);
+
+  sendSMS(message);
+}
+
+// -----------------------------------------------------
+// READ SMS COMMANDS
+// -----------------------------------------------------
+
+void checkIncomingSMS() {
+  gsmSerial.println("AT+CMGF=1");  
+  waitForOK(gsmSerial);
+
+  gsmSerial.println("AT+CMGL=\"REC UNREAD\"");
+  unsigned long start = millis();
+  String sms = "";
+
+  while (millis() - start < 3000) {
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      sms += c;
+    }
+  }
+
+  if (sms.length() == 0) return;
+
+  Serial.println("Incoming SMS:");
+  Serial.println(sms);
+
+  sms.toLowerCase();
+
+  if (sms.indexOf("stop") != -1) {
+    motorStopped = true;
+    digitalWrite(relayPin, LOW); // turn motor OFF
+    sendSMS("Motor stopped");
+    Serial.println("STOP command received!");
+  }
+}
+
+// -----------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);  // GPS
+  gsmSerial.begin(9600, SERIAL_8N1, 18, 19);  // SIM800L
+
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);  // Motor ON initially
+
+  delay(8000);  // Let GSM module boot
+
+  sendLocationSMS();
+  lastLocationSend = millis();
+}
+
+// -----------------------------------------------------
+
+void loop() {
+
+  // GPS feed
+  while (gpsSerial.available() > 0)
+    gps.encode(gpsSerial.read());
+
+  // SIM800L logs
+  while (gsmSerial.available() > 0)
+    Serial.write(gsmSerial.read());
+
+  // Check SMS Commands
+  checkIncomingSMS();
+
+  // ------------------- FIXED RELAY CONTROL -------------------
+  if (motorStopped) {
+    digitalWrite(relayPin, HIGH);   // OFF permanently after stop
+  } else {
+    digitalWrite(relayPin, LOW);  // Always ON normally
+  }
+
+  // Send GPS update every 60s
+  unsigned long now = millis();
+  if (now - lastLocationSend >= LOCATION_INTERVAL) {
+    lastLocationSend = now;
+    sendLocationSMS();
+  }
+}
